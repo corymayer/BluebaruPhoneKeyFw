@@ -13,7 +13,10 @@
 *********************************************************************/
 #include <bluefruit.h>
 #include <ChaCha.h>
+#include "crc32.h"
 
+#define SERVICE_UUID 0xDA026848F2D511E9B26A76BC64B1963E
+#define CHARACTERISTIC_UUID 0xF974F2F4F2D511E9BB23A6C064B1963E
 #define AES_KEY 0x78214125442A472D4B6150645267556B58703273357638792F423F4528482B4D
 #define RSSI_THRESHOLD -70
 
@@ -26,11 +29,19 @@ typedef enum {
   eventRegionEntered, eventRegionExited
 } Event_t;
 
-BLEService testSvc = BLEService(0xDA026848F2D511E9B26A76BC64B1963E);
-BLECharacteristic testChar = BLECharacteristic(0xF974F2F4F2D511E9BB23A6C064B1963E);
+static const char *stateNames[] = {
+  "Advertising",
+  "Connected",
+  "ConnAuth",
+  "ConnAuthNearby"
+};
+
+BLEService dummySvc = BLEService(SERVICE_UUID);
+BLECharacteristic dummyChar = BLECharacteristic(CHARACTERISTIC_UUID);
 
 BLEDis bledis;    // DIS (Device Information Service) helper class instance
 BLEBas blebas;    // BAS (Battery Service) helper class instance
+BLEUart bleuart;
 
 uint8_t  bps = 0;
 
@@ -38,6 +49,7 @@ static State_t state = stateAdvertising;
 static Event_t event = eventNone;
 
 static uint16_t g_conn_handle = 0;
+static crc32_t crc;
 
 void setup() {
   Serial.begin(115200);
@@ -72,8 +84,12 @@ void setup() {
   blebas.begin();
   blebas.write(100);
 
-  Serial.println("Configuring the test Service");
-  setupTest();
+  // Configure and Start BLE Uart Service
+  bleuart.begin();
+  bleuart.setRxCallback(uart_rx_cb);
+
+  Serial.println("Configuring the dummy Service");
+  setupDummy();
 
   startAdv();
 }
@@ -83,7 +99,9 @@ void startAdv(void) {
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
   Bluefruit.Advertising.addTxPower();
 
-  Bluefruit.Advertising.addService(testSvc);
+  Bluefruit.Advertising.addService(bleuart);
+
+  Bluefruit.Advertising.addService(dummySvc);
 
   // Include Name
   Bluefruit.Advertising.addName();
@@ -105,16 +123,27 @@ void startAdv(void) {
   Serial.println("Advertising"); 
 }
 
-void setupTest(void) {
-  testSvc.begin();
+void setupDummy(void) {
+  dummySvc.begin();
 
-  testChar.setProperties(CHR_PROPS_READ);
-  testChar.setPermission(SECMODE_ENC_WITH_MITM, SECMODE_NO_ACCESS);
-  testChar.setFixedLen(1);
-  testChar.begin();
+  dummyChar.setProperties(CHR_PROPS_READ);
+  dummyChar.setPermission(SECMODE_ENC_WITH_MITM, SECMODE_NO_ACCESS);
+  dummyChar.setFixedLen(1);
+  dummyChar.begin();
 
   uint8_t data = 7;
-  testChar.write(&data, 1);
+  dummyChar.write(&data, 1);
+}
+
+void uart_rx_cb(uint16_t conn_hdl) {
+  Serial.println("UART RX");
+
+  uint8_t buf[64];
+  size_t avail = bleuart.available();
+  size_t readBytes = avail > 64 ? 64 : avail;
+  
+  bleuart.read(buf, readBytes);
+  Serial.println((char *)buf);
 }
 
 void connect_callback(uint16_t conn_handle) {
