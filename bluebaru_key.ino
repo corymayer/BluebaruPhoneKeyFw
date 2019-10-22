@@ -237,8 +237,8 @@ static void state_advertising(Event_t ev) {
       set_state(stateConnected);
       break;
     default:
-      Serial.println("Unexpected event");
-      goto cleanup;
+      Serial.print("Unexpected event: ");
+      Serial.println(ev);
       break;
   }
 
@@ -361,7 +361,8 @@ static void state_connected(Event_t ev) {
       set_state(stateConnAuth);
       break;
     default:
-      Serial.println("Unexpected event");
+      Serial.print("Unexpected event: ");
+      Serial.println(ev);
       break;
   }
 
@@ -383,7 +384,8 @@ static void state_conn_auth(Event_t ev) {
       set_state(stateAdvertising);
       break;
     default:
-      Serial.println("Unexpected event");
+      Serial.print("Unexpected event: ");
+      Serial.println(ev);
       break;
   }
   
@@ -406,7 +408,8 @@ static void state_conn_auth_nearby(Event_t ev) {
       set_state(stateAdvertising);
       break;
     default:
-      Serial.println("Unexpected event");
+      Serial.print("Unexpected event: ");
+      Serial.println(ev);
       break;
   }
 cleanup:
