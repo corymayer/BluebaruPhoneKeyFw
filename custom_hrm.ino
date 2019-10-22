@@ -12,13 +12,18 @@
  any redistribution
 *********************************************************************/
 #include <bluefruit.h>
-#include <ChaCha.h>
+#include <ChaChaPoly.h>
 #include "crc32.h"
 
 #define SERVICE_UUID 0xDA026848F2D511E9B26A76BC64B1963E
 #define CHARACTERISTIC_UUID 0xF974F2F4F2D511E9BB23A6C064B1963E
-#define AES_KEY 0x78214125442A472D4B6150645267556B58703273357638792F423F4528482B4D
+#define AES_KEY "w9z$C&E)H@McQfTjWnZr4u7x!A%D*G-J"
+#define AES_KEY_LEN 256
 #define RSSI_THRESHOLD -70
+#define MAX_PACKET_SIZE 64
+
+#define CMD_AUTHENTICATE 7
+#define PKT_HEAD_PLAIN_SIZE 20
 
 typedef enum {
   stateAdvertising, stateConnected, stateConnAuth, stateConnAuthNearby
@@ -26,8 +31,20 @@ typedef enum {
 
 typedef enum {
   eventNone, eventConnected, eventDisconnected, eventAuthPass, eventAuthFail,
-  eventRegionEntered, eventRegionExited
+  eventRegionEntered, eventRegionExited, eventUartRx
 } Event_t;
+
+typedef struct {
+  uint32_t crc;
+  uint32_t pktLen;
+  uint32_t nonce1;
+  uint64_t nonce2;
+} UartPktHdrPlain_t;
+
+typedef struct {
+  uint32_t cmd;
+  uint32_t dataLen;
+} UartPktHdrEnc_t;
 
 static const char *stateNames[] = {
   "Advertising",
@@ -50,6 +67,7 @@ static Event_t event = eventNone;
 
 static uint16_t g_conn_handle = 0;
 static crc32_t crc;
+static uint64_t lastNonce = 0;
 
 void setup() {
   Serial.begin(115200);
@@ -136,14 +154,7 @@ void setupDummy(void) {
 }
 
 void uart_rx_cb(uint16_t conn_hdl) {
-  Serial.println("UART RX");
-
-  uint8_t buf[64];
-  size_t avail = bleuart.available();
-  size_t readBytes = avail > 64 ? 64 : avail;
-  
-  bleuart.read(buf, readBytes);
-  Serial.println((char *)buf);
+  pub_event(eventUartRx);
 }
 
 void connect_callback(uint16_t conn_handle) {
@@ -177,9 +188,9 @@ void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
 
 static void set_state(State_t st) {
   Serial.print("Switching from state ");
-  Serial.print(state);
+  Serial.print(stateNames[state]);
   Serial.print(" to ");
-  Serial.println(st);
+  Serial.println(stateNames[st]);
   
   state = st;
 }
@@ -223,8 +234,6 @@ static void state_advertising(Event_t ev) {
   switch (ev) {
     case eventConnected:
       Serial.println("Connected!");
-      // TODO temp, assume auth passes
-      pub_event(eventAuthPass);
       set_state(stateConnected);
       break;
     default:
@@ -237,8 +246,105 @@ cleanup:
   return;
 }
 
+static bool verify_auth() {
+  bool authPassed = false;
+
+  const size_t nonceSize = 12;
+  const size_t tagLen = 16;
+  
+  ChaChaPoly chacha;
+  uint8_t buf[MAX_PACKET_SIZE];
+  uint8_t decryptedBuf[MAX_PACKET_SIZE];
+  
+  size_t avail = bleuart.available();
+  size_t readBytes = avail > MAX_PACKET_SIZE ? MAX_PACKET_SIZE : avail;
+
+  uint32_t calcCrc = 0;
+  uint32_t pktCrc = 0;
+  uint64_t *nonceFull = (uint64_t *)((uint8_t *)buf + 12);
+  uint32_t truncNonce = 0;
+  uint8_t *encryptedData = (uint8_t *)buf + PKT_HEAD_PLAIN_SIZE;
+  
+  bleuart.read(buf, readBytes);
+  Serial.println((char *)buf);
+//  for (int ndx = 0; ndx < readBytes; ndx++) {
+//    Serial.println(buf[ndx]);
+//  }
+
+  UartPktHdrPlain_t *pkt = (UartPktHdrPlain_t *)buf;
+  UartPktHdrEnc_t *hdrEnc = (UartPktHdrEnc_t *)decryptedBuf;
+
+  uint8_t *nonce = (uint8_t *)&pkt->nonce1;
+  size_t encryptedDataLen = pkt->pktLen - PKT_HEAD_PLAIN_SIZE - tagLen;
+  uint8_t *tag = (uint8_t *)buf + PKT_HEAD_PLAIN_SIZE + encryptedDataLen;
+
+  // verify CRC
+  pktCrc = pkt->crc;
+  memset(&pkt->crc, 0, 4); // clear CRC in packet
+  
+  crc32_t c;
+  crc32_init(&c);
+  crc32_start(&c);
+  crc32_update(&c, buf, pkt->pktLen);
+  calcCrc = crc32_finalize(&c);
+
+  if (pktCrc != calcCrc) {
+    Serial.println("CRC fail!");
+    goto cleanup;
+  }
+
+  Serial.println("CRC pass");
+
+  // decrypt packet
+  for (int ndx = 0; ndx < 12; ndx++) {
+    Serial.print(*(nonce + ndx));
+  }
+  Serial.println("");
+  Serial.println("Decrypting...");
+  chacha.setKey((const uint8_t *)AES_KEY, AES_KEY_LEN);
+  chacha.setIV(nonce, nonceSize);
+
+  chacha.decrypt(decryptedBuf, encryptedData, encryptedDataLen);
+
+  Serial.println("Checking tag...");
+  if (!chacha.checkTag(tag, tagLen)) {
+    Serial.println("Bad tag");
+    goto cleanup;
+  }
+
+  Serial.println("Tag passed. Nonce: ");
+  truncNonce = *nonceFull;
+  Serial.println(truncNonce);
+
+  if (*nonceFull <= lastNonce) {
+    Serial.println("Bad nonce");
+    goto cleanup;
+  }
+
+  Serial.print("Command: ");
+  Serial.println(hdrEnc->cmd);
+  if (hdrEnc->cmd != CMD_AUTHENTICATE) {
+    Serial.println("Bad cmd type");
+    goto cleanup;
+  }
+
+  lastNonce = *nonceFull;
+  authPassed = true;
+
+cleanup:
+  return authPassed;
+}
+
 static void state_connected(Event_t ev) {
     switch (ev) {
+    case eventUartRx:
+      Serial.println("Uart Rx");
+      if (verify_auth()) {
+        pub_event(eventAuthPass);
+      } else {
+        pub_event(eventAuthFail);
+      }
+      break;
     case eventAuthFail:
       Serial.println("Authentication failed");
       startAdv();
