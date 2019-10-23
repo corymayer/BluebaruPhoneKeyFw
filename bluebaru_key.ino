@@ -19,19 +19,21 @@
 #define CHARACTERISTIC_UUID 0xF974F2F4F2D511E9BB23A6C064B1963E
 #define AES_KEY "w9z$C&E)H@McQfTjWnZr4u7x!A%D*G-J"
 #define AES_KEY_LEN 256
-#define RSSI_THRESHOLD -70
-#define MAX_PACKET_SIZE 64
+#define RSSI_THRESHOLD -75
+#define BUTTON_PRESS_TIME_MS 500
+#define WILL_LOCK_TIMEOUT_MS 5000
 
 #define CMD_AUTHENTICATE 7
+#define MAX_PACKET_SIZE 64
 #define PKT_HEAD_PLAIN_SIZE 20
 
 typedef enum {
-  stateAdvertising, stateConnected, stateConnAuth, stateConnAuthNearby
+  stateAdvertising, stateConnected, stateConnAuth, stateConnAuthUnlocked, stateConnAuthWillLock
 } State_t;
 
 typedef enum {
   eventNone, eventConnected, eventDisconnected, eventAuthPass, eventAuthFail,
-  eventRegionEntered, eventRegionExited, eventUartRx
+  eventRegionEntered, eventRegionExited, eventUartRx, eventWillLockTimeout
 } Event_t;
 
 typedef struct {
@@ -50,7 +52,8 @@ static const char *stateNames[] = {
   "Advertising",
   "Connected",
   "ConnAuth",
-  "ConnAuthNearby"
+  "ConnAuthUnlocked",
+  "ConnAuthWillLock"
 };
 
 BLEService dummySvc = BLEService(SERVICE_UUID);
@@ -69,7 +72,22 @@ static uint16_t g_conn_handle = 0;
 static crc32_t crc;
 static uint64_t lastNonce = 0;
 
+static int pinLock = 25;
+static int pinUnlock = 26;
+static int pinTrunk = 27;
+
+static bool willLockTimerEnable = false;
+static int willLockTimerStart = 0;
+
 void setup() {
+  // init pins
+  pinMode(pinLock, OUTPUT);
+  pinMode(pinUnlock, OUTPUT);
+  pinMode(pinTrunk, OUTPUT);
+  digitalWrite(pinLock, LOW);
+  digitalWrite(pinUnlock, LOW);
+  digitalWrite(pinTrunk, LOW);
+  
   Serial.begin(115200);
   while ( !Serial ) delay(10);   // for nrf52840 with native usb
 
@@ -79,6 +97,9 @@ void setup() {
   // Initialise the Bluefruit module
   Serial.println("Initialise the Bluefruit nRF52 module");
   Bluefruit.begin();
+
+  // turn off blue LED
+  Bluefruit.autoConnLed(false);
 
   // Set the advertised device name (keep it short!)
   Serial.println("Setting Device Name to 'BluebaruKey'");
@@ -204,9 +225,9 @@ void rssi_changed_callback(uint16_t conn_hdl, int8_t rssi) {
   Serial.printf("Rssi = %d", rssi);
   Serial.println();
   
-  if (state == stateConnAuth && rssi > RSSI_THRESHOLD) {
+  if (rssi > RSSI_THRESHOLD && (state == stateConnAuth || state == stateConnAuthWillLock)) {
     pub_event(eventRegionEntered);
-  } else if (state == stateConnAuthNearby && rssi < RSSI_THRESHOLD) {
+  } else if (rssi < RSSI_THRESHOLD && (state == stateConnAuthUnlocked)) {
     pub_event(eventRegionExited);
   }
 }
@@ -217,7 +238,7 @@ static void rssi_monitoring_start() {
   // Start monitoring rssi of this connection
   // This function should be called in connect callback
   // Input argument is value difference (to current rssi) that triggers callback
-  connection->monitorRssi(10);
+  connection->monitorRssi(5);
 }
 
 static void rssi_monitoring_stop() {
@@ -227,7 +248,18 @@ static void rssi_monitoring_stop() {
 }
 
 static void set_door_state(bool locked) {
-  // TODO
+  int pin = 0;
+  if (locked) {
+    pin = pinLock;
+    Serial.println("Locking door...");
+  } else {
+    Serial.println("Unlocking door...");
+    pin = pinUnlock;
+  }
+
+  digitalWrite(pin, HIGH);
+  delay(BUTTON_PRESS_TIME_MS);
+  digitalWrite(pin, LOW);
 }
 
 static void state_advertising(Event_t ev) {
@@ -373,9 +405,9 @@ cleanup:
 static void state_conn_auth(Event_t ev) {
   switch (ev) {
     case eventRegionEntered:
-      Serial.println("Region entered! Unlocking door...");
+      Serial.println("Region entered");
       set_door_state(false);
-      set_state(stateConnAuthNearby);
+      set_state(stateConnAuthUnlocked);
       break;
     case eventDisconnected:
       Serial.println("Disconnected");
@@ -393,10 +425,38 @@ cleanup:
   return;
 }
 
-static void state_conn_auth_nearby(Event_t ev) {
+static void state_conn_auth_unlocked(Event_t ev) {
   switch (ev) {
     case eventRegionExited:
-      Serial.println("Region exited! Locking door...");
+      Serial.println("Region exited");
+      willLockTimerEnable = true;
+      willLockTimerStart = millis();
+      set_state(stateConnAuthWillLock);
+      break;
+    case eventDisconnected:
+      Serial.println("Disconnected");
+      set_door_state(true);
+      rssi_monitoring_stop();
+      startAdv();
+      set_state(stateAdvertising);
+      break;
+    default:
+      Serial.print("Unexpected event: ");
+      Serial.println(ev);
+      break;
+  }
+cleanup:
+  return;
+}
+
+static void state_conn_auth_will_lock(Event_t ev) {
+  switch (ev) {
+    case eventRegionEntered:
+      Serial.println("Region entered");
+      set_state(stateConnAuthUnlocked);
+      break;
+    case eventWillLockTimeout:
+      Serial.println("Will lock timeout!");
       set_door_state(true);
       set_state(stateConnAuth);
       break;
@@ -412,14 +472,10 @@ static void state_conn_auth_nearby(Event_t ev) {
       Serial.println(ev);
       break;
   }
-cleanup:
-  return;
 }
 
 void loop() {
   Event_t newEvent = eventNone;
-  
-  digitalToggle(LED_RED);
 
   if (event != eventNone) {
     newEvent = event;
@@ -435,12 +491,23 @@ void loop() {
       case stateConnAuth:
         state_conn_auth(newEvent);
         break;
-      case stateConnAuthNearby:
-        state_conn_auth_nearby(newEvent);
+      case stateConnAuthUnlocked:
+        state_conn_auth_unlocked(newEvent);
+        break;
+      case stateConnAuthWillLock:
+        state_conn_auth_will_lock(newEvent);
         break;
     }
   }
 
-  // Only send update once per second
-  delay(100);
+  if (willLockTimerEnable) {
+    int curTimeMs = millis();
+    if (curTimeMs - willLockTimerStart > WILL_LOCK_TIMEOUT_MS) {
+      pub_event(eventWillLockTimeout);
+      willLockTimerEnable = false;
+    }
+  }
+
+  // sleep to save power
+  delay(200);
 }
