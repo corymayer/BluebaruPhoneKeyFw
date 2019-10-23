@@ -20,15 +20,27 @@
 #define AES_KEY "w9z$C&E)H@McQfTjWnZr4u7x!A%D*G-J"
 #define AES_KEY_LEN 256
 #define RSSI_THRESHOLD -75
+
 #define BUTTON_PRESS_TIME_MS 500
 #define WILL_LOCK_TIMEOUT_MS 5000
+#define AUTH_CHALLENGE_TIMER_PERIOD 2000
+
+#define BATTERY_UPDATE_PERIOD_MS 5000
+#define IDLE_SLEEP_PERIOD_MS 5000
+#define CONNECTED_SLEEP_PERIOD_MS 200
 
 #define CMD_AUTHENTICATE 7
 #define MAX_PACKET_SIZE 64
 #define PKT_HEAD_PLAIN_SIZE 20
 
+#define VBAT_PIN          A7
+#define VBAT_MV_PER_LSB   (0.73242188F) // 3.0V ADC range and 12-bit ADC resolution = 3000mV/4096
+#define VBAT_DIVIDER      (0.71275837F) // 2M + 0.806M voltage divider on VBAT = (2M / (0.806M + 2M))
+#define VBAT_DIVIDER_COMP (1.403F)
+
 typedef enum {
-  stateAdvertising, stateConnected, stateConnAuth, stateConnAuthUnlocked, stateConnAuthWillLock
+  stateAdvertising, stateDisconnected, stateConnected, 
+  stateConnAuth, stateConnAuthUnlocked, stateConnAuthWillLock
 } State_t;
 
 typedef enum {
@@ -50,6 +62,7 @@ typedef struct {
 
 static const char *stateNames[] = {
   "Advertising",
+  "Disconnected",
   "Connected",
   "ConnAuth",
   "ConnAuthUnlocked",
@@ -75,18 +88,28 @@ static uint64_t lastNonce = 0;
 static int pinLock = 25;
 static int pinUnlock = 26;
 static int pinTrunk = 27;
+static int pinBattery = 31;
 
 static bool willLockTimerEnable = false;
 static int willLockTimerStart = 0;
+
+static bool authChallengeTimerEnable = true;
+static bool authChallengeTimerLast = 0;
+
+static int lastBatteryUpdateTime = 0;
 
 void setup() {
   // init pins
   pinMode(pinLock, OUTPUT);
   pinMode(pinUnlock, OUTPUT);
   pinMode(pinTrunk, OUTPUT);
+  
   digitalWrite(pinLock, LOW);
   digitalWrite(pinUnlock, LOW);
   digitalWrite(pinTrunk, LOW);
+
+  // Get a single ADC sample and throw it away
+  readVBAT();
   
   Serial.begin(115200);
   while ( !Serial ) delay(10);   // for nrf52840 with native usb
@@ -121,7 +144,6 @@ void setup() {
   // Start the BLE Battery Service and set it to 100%
   Serial.println("Configuring the Battery Service");
   blebas.begin();
-  blebas.write(100);
 
   // Configure and Start BLE Uart Service
   bleuart.begin();
@@ -130,7 +152,68 @@ void setup() {
   Serial.println("Configuring the dummy Service");
   setupDummy();
 
+  updateBatSvc();
+
   startAdv();
+}
+
+int readVBAT(void) {
+  int raw;
+
+  // Set the analog reference to 3.0V (default = 3.6V) 
+  analogReference(AR_INTERNAL_3_0);
+  
+  // Set the resolution to 12-bit (0..4095) 
+  analogReadResolution(12); // Can be 8, 10, 12 or 14
+  
+  // Let the ADC settle
+  delay(1);
+  
+  // Get the raw 12-bit, 0..3000mV ADC value 
+  raw = analogRead(VBAT_PIN);
+  
+  // Set the ADC back to the default settings 
+  analogReference(AR_DEFAULT); 
+  analogReadResolution(10);
+  
+  return raw;
+}
+
+uint8_t mvToPercent(float mvolts) { 
+  uint8_t battery_level;
+  
+  if (mvolts >= 3000) {
+    battery_level = 100;
+  } else if (mvolts > 2900) {
+    battery_level = 100 - ((3000 - mvolts) * 58) / 100;
+  } else if (mvolts > 2740) {
+    battery_level = 42 - ((2900 - mvolts) * 24) / 160;
+  } else if (mvolts > 2440) {
+    battery_level = 18 - ((2740 - mvolts) * 12) / 300;
+  } else if (mvolts > 2100) {
+    battery_level = 6 - ((2440 - mvolts) * 6) / 340;
+  } else {
+    battery_level = 0;
+  }
+  
+  return battery_level;
+}
+
+void updateBatSvc() {
+  // Get a raw ADC reading 
+  int vbat_raw = readVBAT();
+  
+  // Convert from raw mv to percentage (based on LIPO chemistry) 
+  uint8_t vbat_per = mvToPercent(vbat_raw * VBAT_MV_PER_LSB);
+
+  float vbat_mv = (float)vbat_raw * VBAT_MV_PER_LSB * VBAT_DIVIDER_COMP;
+
+  Serial.print("Bat percent: ");
+  Serial.println(vbat_per);
+  Serial.print("Bat mV: ");
+  Serial.println(vbat_mv);
+
+  blebas.write(vbat_per);
 }
 
 void startAdv(void) {
@@ -262,22 +345,6 @@ static void set_door_state(bool locked) {
   digitalWrite(pin, LOW);
 }
 
-static void state_advertising(Event_t ev) {
-  switch (ev) {
-    case eventConnected:
-      Serial.println("Connected!");
-      set_state(stateConnected);
-      break;
-    default:
-      Serial.print("Unexpected event: ");
-      Serial.println(ev);
-      break;
-  }
-
-cleanup:
-  return;
-}
-
 static bool verify_auth() {
   bool authPassed = false;
 
@@ -367,11 +434,55 @@ cleanup:
   return authPassed;
 }
 
+static void send_auth_rdy() {
+  char *msg = "authChallenge";
+
+  Serial.println("Sending auth challenge");
+  bleuart.write(msg, strlen(msg));
+}
+
+static void state_advertising(Event_t ev) {
+  switch (ev) {
+    case eventConnected:
+      Serial.println("Connected!");
+      Bluefruit.Advertising.stop(); 
+      set_state(stateConnected);
+      authChallengeTimerEnable = true;
+      break;
+    default:
+      Serial.print("Unexpected event: ");
+      Serial.println(ev);
+      break;
+  }
+
+cleanup:
+  return;
+}
+
+static void state_disconnected(Event_t ev) {
+  switch (ev) {
+    case eventConnected:
+      Serial.println("Connected!");
+      set_state(stateConnected);
+      authChallengeTimerEnable = true;
+      break;
+    default:
+      Serial.print("Unexpected event: ");
+      Serial.println(ev);
+      break;
+  }
+
+cleanup:
+  return;
+}
+
 static void state_connected(Event_t ev) {
-    switch (ev) {
+  BLEConnection* connection;
+  switch (ev) {
     case eventUartRx:
       Serial.println("Uart Rx");
       if (verify_auth()) {
+        authChallengeTimerEnable = false;
         pub_event(eventAuthPass);
       } else {
         pub_event(eventAuthFail);
@@ -379,13 +490,14 @@ static void state_connected(Event_t ev) {
       break;
     case eventAuthFail:
       Serial.println("Authentication failed");
+      connection = Bluefruit.Connection(g_conn_handle);
+      connection->disconnect();
       startAdv();
       set_state(stateAdvertising);
       break;
     case eventDisconnected:
       Serial.println("Disconnected");
-      startAdv();
-      set_state(stateAdvertising);
+      set_state(stateDisconnected);
       break;
     case eventAuthPass:
       Serial.println("Authentication passed!");
@@ -412,8 +524,7 @@ static void state_conn_auth(Event_t ev) {
     case eventDisconnected:
       Serial.println("Disconnected");
       rssi_monitoring_stop();
-      startAdv();
-      set_state(stateAdvertising);
+      set_state(stateDisconnected);
       break;
     default:
       Serial.print("Unexpected event: ");
@@ -437,8 +548,7 @@ static void state_conn_auth_unlocked(Event_t ev) {
       Serial.println("Disconnected");
       set_door_state(true);
       rssi_monitoring_stop();
-      startAdv();
-      set_state(stateAdvertising);
+      set_state(stateDisconnected);
       break;
     default:
       Serial.print("Unexpected event: ");
@@ -464,8 +574,7 @@ static void state_conn_auth_will_lock(Event_t ev) {
       Serial.println("Disconnected");
       set_door_state(true);
       rssi_monitoring_stop();
-      startAdv();
-      set_state(stateAdvertising);
+      set_state(stateDisconnected);
       break;
     default:
       Serial.print("Unexpected event: ");
@@ -485,6 +594,9 @@ void loop() {
       case stateAdvertising:
         state_advertising(newEvent);
         break;
+      case stateDisconnected:
+        state_disconnected(newEvent);
+        break;
       case stateConnected:
         state_connected(newEvent);
         break;
@@ -500,14 +612,35 @@ void loop() {
     }
   }
 
+  // janky timers
+  int curTimeMs = millis();
   if (willLockTimerEnable) {
-    int curTimeMs = millis();
     if (curTimeMs - willLockTimerStart > WILL_LOCK_TIMEOUT_MS) {
       pub_event(eventWillLockTimeout);
       willLockTimerEnable = false;
     }
   }
 
-  // sleep to save power
-  delay(200);
+  if (authChallengeTimerEnable) {
+    if (curTimeMs - authChallengeTimerLast > AUTH_CHALLENGE_TIMER_PERIOD) {
+      authChallengeTimerLast = curTimeMs;
+
+      send_auth_rdy();
+    }
+  }
+
+  // update battery level
+  if (state != stateDisconnected && curTimeMs - lastBatteryUpdateTime > BATTERY_UPDATE_PERIOD_MS) {
+    lastBatteryUpdateTime = curTimeMs;
+
+    updateBatSvc();
+  }
+
+  // delay calls vTaskDelay and puts MCU to sleep
+  if (stateDisconnected == state) {
+    Serial.println("Sleeping for 5s");
+    delay(IDLE_SLEEP_PERIOD_MS);
+  } else {
+    delay(CONNECTED_SLEEP_PERIOD_MS);
+  }
 }
