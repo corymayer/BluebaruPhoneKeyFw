@@ -335,14 +335,25 @@ static void set_door_state(bool locked) {
   if (locked) {
     pin = pinLock;
     Serial.println("Locking door...");
+    
+    digitalWrite(pin, HIGH);
+    delay(BUTTON_PRESS_TIME_MS);
+    digitalWrite(pin, LOW);
   } else {
-    Serial.println("Unlocking door...");
+    // double unlock for all doors
+    Serial.println("Unlocking doors...");
     pin = pinUnlock;
-  }
 
-  digitalWrite(pin, HIGH);
-  delay(BUTTON_PRESS_TIME_MS);
-  digitalWrite(pin, LOW);
+    digitalWrite(pin, HIGH);
+    delay(BUTTON_PRESS_TIME_MS);
+    digitalWrite(pin, LOW);
+
+    delay(BUTTON_PRESS_TIME_MS);
+
+    digitalWrite(pin, HIGH);
+    delay(BUTTON_PRESS_TIME_MS);
+    digitalWrite(pin, LOW);
+  }
 }
 
 static bool verify_auth() {
