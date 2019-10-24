@@ -15,12 +15,13 @@
 #include <ChaChaPoly.h>
 #include "crc32.h"
 
+#define ACTUATE_DOOR 1
+
 #define SERVICE_UUID 0xDA026848F2D511E9B26A76BC64B1963E
 #define CHARACTERISTIC_UUID 0xF974F2F4F2D511E9BB23A6C064B1963E
 #define AES_KEY "w9z$C&E)H@McQfTjWnZr4u7x!A%D*G-J"
 #define AES_KEY_LEN 256
 #define RSSI_THRESHOLD -75
-
 #define BUTTON_PRESS_TIME_MS 500
 #define WILL_LOCK_TIMEOUT_MS 5000
 #define AUTH_CHALLENGE_TIMER_PERIOD 2000
@@ -35,8 +36,9 @@
 
 #define VBAT_PIN          A7
 #define VBAT_MV_PER_LSB   (0.73242188F) // 3.0V ADC range and 12-bit ADC resolution = 3000mV/4096
-#define VBAT_DIVIDER      (0.71275837F) // 2M + 0.806M voltage divider on VBAT = (2M / (0.806M + 2M))
-#define VBAT_DIVIDER_COMP (1.403F)
+#define VBAT_DIVIDER      (0.71275837F)   // 2M + 0.806M voltage divider on VBAT = (2M / (0.806M + 2M))
+#define VBAT_DIVIDER_COMP (1.403F)        // Compensation factor for the VBAT divider
+#define REAL_VBAT_MV_PER_LSB (VBAT_DIVIDER_COMP * VBAT_MV_PER_LSB)
 
 typedef enum {
   stateAdvertising, stateDisconnected, stateConnected, 
@@ -176,37 +178,32 @@ int readVBAT(void) {
   analogReference(AR_DEFAULT); 
   analogReadResolution(10);
   
-  return raw;
+  // Convert the raw value to compensated mv, taking the resistor-
+  // divider into account (providing the actual LIPO voltage)
+  // ADC range is 0..3000mV and resolution is 12-bit (0..4095)
+  return raw * REAL_VBAT_MV_PER_LSB;
 }
 
 uint8_t mvToPercent(float mvolts) { 
-  uint8_t battery_level;
-  
-  if (mvolts >= 3000) {
-    battery_level = 100;
-  } else if (mvolts > 2900) {
-    battery_level = 100 - ((3000 - mvolts) * 58) / 100;
-  } else if (mvolts > 2740) {
-    battery_level = 42 - ((2900 - mvolts) * 24) / 160;
-  } else if (mvolts > 2440) {
-    battery_level = 18 - ((2740 - mvolts) * 12) / 300;
-  } else if (mvolts > 2100) {
-    battery_level = 6 - ((2440 - mvolts) * 6) / 340;
-  } else {
-    battery_level = 0;
+  if (mvolts < 3300) {
+    return 0;
   }
-  
-  return battery_level;
+
+  if (mvolts < 3600) {
+    mvolts -= 3300;
+    return mvolts / 30;
+  }
+
+  mvolts -= 3600;
+  return 10 + (mvolts * 0.15F);  // thats mvolts /6.66666666
 }
 
 void updateBatSvc() {
   // Get a raw ADC reading 
-  int vbat_raw = readVBAT();
+  int vbat_mv = readVBAT();
   
   // Convert from raw mv to percentage (based on LIPO chemistry) 
-  uint8_t vbat_per = mvToPercent(vbat_raw * VBAT_MV_PER_LSB);
-
-  float vbat_mv = (float)vbat_raw * VBAT_MV_PER_LSB * VBAT_DIVIDER_COMP;
+  uint8_t vbat_per = mvToPercent(vbat_mv);
 
   Serial.print("Bat percent: ");
   Serial.println(vbat_per);
@@ -335,15 +332,18 @@ static void set_door_state(bool locked) {
   if (locked) {
     pin = pinLock;
     Serial.println("Locking door...");
-    
+
+#if ACTUATE_DOOR
     digitalWrite(pin, HIGH);
     delay(BUTTON_PRESS_TIME_MS);
     digitalWrite(pin, LOW);
+#endif
   } else {
     // double unlock for all doors
     Serial.println("Unlocking doors...");
     pin = pinUnlock;
 
+#if ACTUATE_DOOR
     digitalWrite(pin, HIGH);
     delay(BUTTON_PRESS_TIME_MS);
     digitalWrite(pin, LOW);
@@ -353,6 +353,7 @@ static void set_door_state(bool locked) {
     digitalWrite(pin, HIGH);
     delay(BUTTON_PRESS_TIME_MS);
     digitalWrite(pin, LOW);
+#endif
   }
 }
 
@@ -574,6 +575,7 @@ static void state_conn_auth_will_lock(Event_t ev) {
   switch (ev) {
     case eventRegionEntered:
       Serial.println("Region entered");
+      willLockTimerEnable = false;
       set_state(stateConnAuthUnlocked);
       break;
     case eventWillLockTimeout:
@@ -583,6 +585,7 @@ static void state_conn_auth_will_lock(Event_t ev) {
       break;
     case eventDisconnected:
       Serial.println("Disconnected");
+      willLockTimerEnable = false;
       set_door_state(true);
       rssi_monitoring_stop();
       set_state(stateDisconnected);
