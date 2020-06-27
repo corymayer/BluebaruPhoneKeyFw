@@ -1,27 +1,20 @@
-/*********************************************************************
- This is an example for our nRF52 based Bluefruit LE modules
-
- Pick one up today in the adafruit shop!
-
- Adafruit invests time and resources providing this open source code,
- please support Adafruit and open-source hardware by purchasing
- products from Adafruit!
-
- MIT license, check LICENSE for more information
- All text above, and the splash screen below must be included in
- any redistribution
-*********************************************************************/
+/**
+ * Bluebaru Phone Key Firmware
+ * https://github.com/corymayer/BluebaruPhoneKeyFw
+ */
 #include <bluefruit.h>
 #include <ChaChaPoly.h>
 #include "crc32.h"
+#include "adafruit_utils.h"
+#include "ble.h"
 
+// set to zero to disable GPIO output, useful for debugging
 #define ACTUATE_DOOR 1
 
-#define SERVICE_UUID 0xDA026848F2D511E9B26A76BC64B1963E
-#define CHARACTERISTIC_UUID 0xF974F2F4F2D511E9BB23A6C064B1963E
-#define AES_KEY "w9z$C&E)H@McQfTjWnZr4u7x!A%D*G-J"
+#define AES_KEY "w9z$C&E)H@McQfTjWnZr4u7x!A%D*G-J" // change this to your key
 #define AES_KEY_LEN 256
-#define RSSI_THRESHOLD -75
+#define RSSI_THRESHOLD -75 // adjust this to change how close you need to get to unlock the door
+
 #define BUTTON_PRESS_TIME_MS 500
 #define WILL_LOCK_TIMEOUT_MS 5000
 #define AUTH_CHALLENGE_TIMER_PERIOD 2000
@@ -34,11 +27,8 @@
 #define MAX_PACKET_SIZE 64
 #define PKT_HEAD_PLAIN_SIZE 20
 
-#define VBAT_PIN          A7
-#define VBAT_MV_PER_LSB   (0.73242188F) // 3.0V ADC range and 12-bit ADC resolution = 3000mV/4096
-#define VBAT_DIVIDER      (0.71275837F)   // 2M + 0.806M voltage divider on VBAT = (2M / (0.806M + 2M))
-#define VBAT_DIVIDER_COMP (1.403F)        // Compensation factor for the VBAT divider
-#define REAL_VBAT_MV_PER_LSB (VBAT_DIVIDER_COMP * VBAT_MV_PER_LSB)
+#define SERIAL_INIT_DELAY_MS 10
+#define SERIAL_BAUD 115200
 
 typedef enum {
   stateAdvertising, stateDisconnected, stateConnected, 
@@ -71,19 +61,11 @@ static const char *stateNames[] = {
   "ConnAuthWillLock"
 };
 
-BLEService dummySvc = BLEService(SERVICE_UUID);
-BLECharacteristic dummyChar = BLECharacteristic(CHARACTERISTIC_UUID);
-
-BLEDis bledis;    // DIS (Device Information Service) helper class instance
-BLEBas blebas;    // BAS (Battery Service) helper class instance
-BLEUart bleuart;
-
-uint8_t  bps = 0;
+static uint8_t curConnHandle = 0;
 
 static State_t state = stateAdvertising;
 static Event_t event = eventNone;
 
-static uint16_t g_conn_handle = 0;
 static crc32_t crc;
 static uint64_t lastNonce = 0;
 
@@ -100,193 +82,9 @@ static bool authChallengeTimerLast = 0;
 
 static int lastBatteryUpdateTime = 0;
 
-void setup() {
-  // init pins
-  pinMode(pinLock, OUTPUT);
-  pinMode(pinUnlock, OUTPUT);
-  pinMode(pinTrunk, OUTPUT);
-  
-  digitalWrite(pinLock, LOW);
-  digitalWrite(pinUnlock, LOW);
-  digitalWrite(pinTrunk, LOW);
-
-  // Get a single ADC sample and throw it away
-  readVBAT();
-  
-  Serial.begin(115200);
-  while ( !Serial ) delay(10);   // for nrf52840 with native usb
-
-  Serial.println("Bluefruit52 HRM Example");
-  Serial.println("-----------------------\n");
-
-  // Initialise the Bluefruit module
-  Serial.println("Initialise the Bluefruit nRF52 module");
-  Bluefruit.begin();
-
-  // turn off blue LED
-  Bluefruit.autoConnLed(false);
-
-  // Set the advertised device name (keep it short!)
-  Serial.println("Setting Device Name to 'BluebaruKey'");
-  Bluefruit.setName("BluebaruKey");
-
-  // Set the connect/disconnect callback handlers
-  Bluefruit.Periph.setConnectCallback(connect_callback);
-  Bluefruit.Periph.setDisconnectCallback(disconnect_callback);
-
-  // Set up Rssi changed callback
-  Bluefruit.setRssiCallback(rssi_changed_callback);
-
-  // Configure and Start the Device Information Service
-  Serial.println("Configuring the Device Information Service");
-  bledis.setManufacturer("Adafruit Industries");
-  bledis.setModel("Bluefruit Feather52");
-  bledis.begin();
-
-  // Start the BLE Battery Service and set it to 100%
-  Serial.println("Configuring the Battery Service");
-  blebas.begin();
-
-  // Configure and Start BLE Uart Service
-  bleuart.begin();
-  bleuart.setRxCallback(uart_rx_cb);
-
-  Serial.println("Configuring the dummy Service");
-  setupDummy();
-
-  updateBatSvc();
-
-  startAdv();
-}
-
-int readVBAT(void) {
-  int raw;
-
-  // Set the analog reference to 3.0V (default = 3.6V) 
-  analogReference(AR_INTERNAL_3_0);
-  
-  // Set the resolution to 12-bit (0..4095) 
-  analogReadResolution(12); // Can be 8, 10, 12 or 14
-  
-  // Let the ADC settle
-  delay(1);
-  
-  // Get the raw 12-bit, 0..3000mV ADC value 
-  raw = analogRead(VBAT_PIN);
-  
-  // Set the ADC back to the default settings 
-  analogReference(AR_DEFAULT); 
-  analogReadResolution(10);
-  
-  // Convert the raw value to compensated mv, taking the resistor-
-  // divider into account (providing the actual LIPO voltage)
-  // ADC range is 0..3000mV and resolution is 12-bit (0..4095)
-  return raw * REAL_VBAT_MV_PER_LSB;
-}
-
-uint8_t mvToPercent(float mvolts) { 
-  if (mvolts < 3300) {
-    return 0;
-  }
-
-  if (mvolts < 3600) {
-    mvolts -= 3300;
-    return mvolts / 30;
-  }
-
-  mvolts -= 3600;
-  return 10 + (mvolts * 0.15F);  // thats mvolts /6.66666666
-}
-
-void updateBatSvc() {
-  // Get a raw ADC reading 
-  int vbat_mv = readVBAT();
-  
-  // Convert from raw mv to percentage (based on LIPO chemistry) 
-  uint8_t vbat_per = mvToPercent(vbat_mv);
-
-  Serial.print("Bat percent: ");
-  Serial.println(vbat_per);
-  Serial.print("Bat mV: ");
-  Serial.println(vbat_mv);
-
-  blebas.write(vbat_per);
-}
-
-void startAdv(void) {
-  // Advertising packet
-  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
-  Bluefruit.Advertising.addTxPower();
-
-  Bluefruit.Advertising.addService(bleuart);
-
-  Bluefruit.Advertising.addService(dummySvc);
-
-  // Include Name
-  Bluefruit.Advertising.addName();
-  
-  /* Start Advertising
-   * - Enable auto advertising if disconnected
-   * - Interval:  fast mode = 20 ms, slow mode = 152.5 ms
-   * - Timeout for fast mode is 30 seconds
-   * - Start(timeout) with timeout = 0 will advertise forever (until connected)
-   * 
-   * For recommended advertising interval
-   * https://developer.apple.com/library/content/qa/qa1931/_index.html   
-   */
-  Bluefruit.Advertising.restartOnDisconnect(true);
-  Bluefruit.Advertising.setInterval(32, 244);    // in unit of 0.625 ms
-  Bluefruit.Advertising.setFastTimeout(30);      // number of seconds in fast mode
-  Bluefruit.Advertising.start(0);                // 0 = Don't stop advertising after n seconds  
-
-  Serial.println("Advertising"); 
-}
-
-void setupDummy(void) {
-  dummySvc.begin();
-
-  dummyChar.setProperties(CHR_PROPS_READ);
-  dummyChar.setPermission(SECMODE_ENC_WITH_MITM, SECMODE_NO_ACCESS);
-  dummyChar.setFixedLen(1);
-  dummyChar.begin();
-
-  uint8_t data = 7;
-  dummyChar.write(&data, 1);
-}
-
-void uart_rx_cb(uint16_t conn_hdl) {
-  pub_event(eventUartRx);
-}
-
-void connect_callback(uint16_t conn_handle) {
-  // Get the reference to current connection
-  BLEConnection* connection = Bluefruit.Connection(conn_handle);
-
-  char central_name[32] = { 0 };
-  connection->getPeerName(central_name, sizeof(central_name));
-
-  Serial.print("Connected to ");
-  Serial.println(central_name);
-
-  g_conn_handle = conn_handle;
-
-  pub_event(eventConnected);
-}
-
 /**
- * Callback invoked when a connection is dropped
- * @param conn_handle connection where this event happens
- * @param reason is a BLE_HCI_STATUS_CODE which can be found in ble_hci.h
+ * Sets the new state and echos to UART.
  */
-void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
-  (void) conn_handle;
-  (void) reason;
-
-  Serial.print("Disconnected, reason = 0x"); Serial.println(reason, HEX);
-
-  pub_event(eventDisconnected);
-}
-
 static void set_state(State_t st) {
   Serial.print("Switching from state ");
   Serial.print(stateNames[state]);
@@ -296,12 +94,31 @@ static void set_state(State_t st) {
   state = st;
 }
 
+/**
+ * Publishes an event by setting the event var.
+ * TODO: this is not thread safe, should find a way to tap into FreeRTOS queues in the future.
+ */
 static void pub_event(Event_t ev) {
   event = ev;
 }
 
-void rssi_changed_callback(uint16_t conn_hdl, int8_t rssi) {
-  (void) conn_hdl;
+/**
+ * Callback for data recvd on UART.
+ */
+void ble_uart_rx_cb(uint16_t conn_hdl) {
+  pub_event(eventUartRx);
+}
+
+void ble_connect_cb(uint16_t conn_hdl) {
+  curConnHandle = conn_hdl;
+  pub_event(eventConnected);
+}
+
+void ble_disconnect_cb(uint16_t conn_hdl, uint8_t reason) {
+  pub_event(eventDisconnected);
+}
+
+void ble_rssi_cb(uint16_t handle, int8_t rssi) {
   Serial.printf("Rssi = %d", rssi);
   Serial.println();
   
@@ -312,21 +129,37 @@ void rssi_changed_callback(uint16_t conn_hdl, int8_t rssi) {
   }
 }
 
-static void rssi_monitoring_start() {
-  BLEConnection* connection = Bluefruit.Connection(g_conn_handle);
+/**
+ * Initializes the hardware peripherals.
+ */
+void initPeripherals(void) {
+  pinMode(pinLock, OUTPUT);
+  pinMode(pinUnlock, OUTPUT);
+  pinMode(pinTrunk, OUTPUT);
   
-  // Start monitoring rssi of this connection
-  // This function should be called in connect callback
-  // Input argument is value difference (to current rssi) that triggers callback
-  connection->monitorRssi(5);
+  digitalWrite(pinLock, LOW);
+  digitalWrite(pinUnlock, LOW);
+  digitalWrite(pinTrunk, LOW);
+
+  // start up ADC
+  readVBAT();
+
+  // init serial
+  while (!Serial) delay(SERIAL_INIT_DELAY_MS);
+  Serial.begin(SERIAL_BAUD);
 }
 
-static void rssi_monitoring_stop() {
-  BLEConnection* connection = Bluefruit.Connection(g_conn_handle);
-
-  connection->stopRssi();
+void setup() {  
+  initPeripherals();
+  
+  Serial.println("Bluebaru Phone Key\n");
+  
+  BLEStart(ble_connect_cb, ble_disconnect_cb, ble_rssi_cb, ble_uart_rx_cb);
 }
 
+/**
+ * Locks or unlocks the door. If ACTUATE_DOOR is set, the fob GPIO will be output accordingly.
+ */
 static void set_door_state(bool locked) {
   int pin = 0;
   if (locked) {
@@ -357,6 +190,11 @@ static void set_door_state(bool locked) {
   }
 }
 
+/**
+ * Reads auth response, decrypts it using the ChaChaPoly cipher,
+ * and verifies the connection is secure.
+ * TODO: break down into smaller funcs
+ */
 static bool verify_auth() {
   bool authPassed = false;
 
@@ -367,7 +205,7 @@ static bool verify_auth() {
   uint8_t buf[MAX_PACKET_SIZE];
   uint8_t decryptedBuf[MAX_PACKET_SIZE];
   
-  size_t avail = bleuart.available();
+  size_t avail = BLEUartGetBytesAvail();
   size_t readBytes = avail > MAX_PACKET_SIZE ? MAX_PACKET_SIZE : avail;
 
   uint32_t calcCrc = 0;
@@ -376,11 +214,8 @@ static bool verify_auth() {
   uint32_t truncNonce = 0;
   uint8_t *encryptedData = (uint8_t *)buf + PKT_HEAD_PLAIN_SIZE;
   
-  bleuart.read(buf, readBytes);
+  BLEUartRead(buf, readBytes);
   Serial.println((char *)buf);
-//  for (int ndx = 0; ndx < readBytes; ndx++) {
-//    Serial.println(buf[ndx]);
-//  }
 
   UartPktHdrPlain_t *pkt = (UartPktHdrPlain_t *)buf;
   UartPktHdrEnc_t *hdrEnc = (UartPktHdrEnc_t *)decryptedBuf;
@@ -446,18 +281,21 @@ cleanup:
   return authPassed;
 }
 
+/**
+ * Sends the authentication challenge message to the iOS app over BLE UART.
+ */
 static void send_auth_rdy() {
   char *msg = "authChallenge";
 
   Serial.println("Sending auth challenge");
-  bleuart.write(msg, strlen(msg));
+  BLEUartWrite((uint8_t *)msg, strlen(msg));
 }
 
 static void state_advertising(Event_t ev) {
   switch (ev) {
     case eventConnected:
       Serial.println("Connected!");
-      Bluefruit.Advertising.stop(); 
+      BLEStopAdvertising();
       set_state(stateConnected);
       authChallengeTimerEnable = true;
       break;
@@ -489,7 +327,6 @@ cleanup:
 }
 
 static void state_connected(Event_t ev) {
-  BLEConnection* connection;
   switch (ev) {
     case eventUartRx:
       Serial.println("Uart Rx");
@@ -502,10 +339,10 @@ static void state_connected(Event_t ev) {
       break;
     case eventAuthFail:
       Serial.println("Authentication failed");
-      connection = Bluefruit.Connection(g_conn_handle);
-      connection->disconnect();
-      startAdv();
+      BLEDisconnect(curConnHandle);
+      
       set_state(stateAdvertising);
+      BLEStartAdvertising();
       break;
     case eventDisconnected:
       Serial.println("Disconnected");
@@ -513,7 +350,7 @@ static void state_connected(Event_t ev) {
       break;
     case eventAuthPass:
       Serial.println("Authentication passed!");
-      rssi_monitoring_start();
+      BLERssiMonitorStart(curConnHandle);
       set_state(stateConnAuth);
       break;
     default:
@@ -535,7 +372,7 @@ static void state_conn_auth(Event_t ev) {
       break;
     case eventDisconnected:
       Serial.println("Disconnected");
-      rssi_monitoring_stop();
+      BLERssiMonitorStop(curConnHandle);
       set_state(stateDisconnected);
       break;
     default:
@@ -559,7 +396,7 @@ static void state_conn_auth_unlocked(Event_t ev) {
     case eventDisconnected:
       Serial.println("Disconnected");
       set_door_state(true);
-      rssi_monitoring_stop();
+      BLERssiMonitorStop(curConnHandle);
       set_state(stateDisconnected);
       break;
     default:
@@ -587,7 +424,7 @@ static void state_conn_auth_will_lock(Event_t ev) {
       Serial.println("Disconnected");
       willLockTimerEnable = false;
       set_door_state(true);
-      rssi_monitoring_stop();
+      BLERssiMonitorStop(curConnHandle);
       set_state(stateDisconnected);
       break;
     default:
@@ -647,10 +484,10 @@ void loop() {
   if (state != stateDisconnected && curTimeMs - lastBatteryUpdateTime > BATTERY_UPDATE_PERIOD_MS) {
     lastBatteryUpdateTime = curTimeMs;
 
-    updateBatSvc();
+    BLEBatSvcUpdate();
   }
 
-  // delay calls vTaskDelay and puts MCU to sleep
+  // delay calls vTaskDelay and puts MCU to sleep to save power
   if (stateDisconnected == state) {
     Serial.println("Sleeping for 5s");
     delay(IDLE_SLEEP_PERIOD_MS);
