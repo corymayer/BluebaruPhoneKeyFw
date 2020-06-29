@@ -4,6 +4,7 @@
  */
 #include <bluefruit.h>
 #include <ChaChaPoly.h>
+#include <assert.h>
 #include "crc32.h"
 #include "adafruit_utils.h"
 #include "ble.h"
@@ -25,7 +26,7 @@
 
 #define CMD_AUTHENTICATE 7
 #define MAX_PACKET_SIZE 64
-#define PKT_HEAD_PLAIN_SIZE 20
+#define NONCE_LEN 12
 
 #define SERIAL_INIT_DELAY_MS 10
 #define SERIAL_BAUD 115200
@@ -43,8 +44,7 @@ typedef enum {
 typedef struct {
   uint32_t crc;
   uint32_t pktLen;
-  uint32_t nonce1;
-  uint64_t nonce2;
+  uint64_t nonce;
 } UartPktHdrPlain_t;
 
 typedef struct {
@@ -83,6 +83,19 @@ static bool authChallengeTimerLast = 0;
 static int lastBatteryUpdateTime = 0;
 
 /**
+ * Prints a uint64_t in HEX.
+ */
+static void print_uint64_hex(uint64_t num) {
+  const int bitsInByte = 8;
+  
+  uint32_t lower = num & 0x0000FFFF;
+  uint32_t higher = (num >> (bitsInByte * sizeof(uint32_t)));
+
+  Serial.print(higher, HEX);
+  Serial.print(lower, HEX);
+}
+
+/**
  * Sets the new state and echos to UART.
  */
 static void set_state(State_t st) {
@@ -109,15 +122,24 @@ void ble_uart_rx_cb(uint16_t conn_hdl) {
   pub_event(eventUartRx);
 }
 
+/**
+ * Callback for BLE connections received.
+ */
 void ble_connect_cb(uint16_t conn_hdl) {
   curConnHandle = conn_hdl;
   pub_event(eventConnected);
 }
 
+/**
+ * Callback for BLE connections closed.
+ */
 void ble_disconnect_cb(uint16_t conn_hdl, uint8_t reason) {
   pub_event(eventDisconnected);
 }
 
+/**
+ * Callback for BLE RSSI changing on a connection.
+ */
 void ble_rssi_cb(uint16_t handle, int8_t rssi) {
   Serial.printf("Rssi = %d", rssi);
   Serial.println();
@@ -191,82 +213,107 @@ static void set_door_state(bool locked) {
 }
 
 /**
- * Reads auth response, decrypts it using the ChaChaPoly cipher,
- * and verifies the connection is secure.
- * TODO: break down into smaller funcs
+ * Computes packet CRC and compares it to the one stored in the header.
+ * @param pkt packet header
+ * @param pktBuf buffer holding the full packet
+ * @return true if pass, false if not
  */
-static bool verify_auth() {
-  bool authPassed = false;
-
-  const size_t nonceSize = 12;
-  const size_t tagLen = 16;
-  
-  ChaChaPoly chacha;
-  uint8_t buf[MAX_PACKET_SIZE];
-  uint8_t decryptedBuf[MAX_PACKET_SIZE];
-  
-  size_t avail = BLEUartGetBytesAvail();
-  size_t readBytes = avail > MAX_PACKET_SIZE ? MAX_PACKET_SIZE : avail;
-
+static bool verify_crc(UartPktHdrPlain_t *pkt, uint8_t *pktBuf) {
   uint32_t calcCrc = 0;
   uint32_t pktCrc = 0;
-  uint64_t *nonceFull = (uint64_t *)((uint8_t *)buf + 12);
-  uint32_t truncNonce = 0;
-  uint8_t *encryptedData = (uint8_t *)buf + PKT_HEAD_PLAIN_SIZE;
   
-  BLEUartRead(buf, readBytes);
-  Serial.println((char *)buf);
-
-  UartPktHdrPlain_t *pkt = (UartPktHdrPlain_t *)buf;
-  UartPktHdrEnc_t *hdrEnc = (UartPktHdrEnc_t *)decryptedBuf;
-
-  uint8_t *nonce = (uint8_t *)&pkt->nonce1;
-  size_t encryptedDataLen = pkt->pktLen - PKT_HEAD_PLAIN_SIZE - tagLen;
-  uint8_t *tag = (uint8_t *)buf + PKT_HEAD_PLAIN_SIZE + encryptedDataLen;
-
-  // verify CRC
   pktCrc = pkt->crc;
-  memset(&pkt->crc, 0, 4); // clear CRC in packet
+  pkt->crc = 0; // clear CRC in packet
   
   crc32_t c;
   crc32_init(&c);
   crc32_start(&c);
-  crc32_update(&c, buf, pkt->pktLen);
+  crc32_update(&c, pktBuf, pkt->pktLen);
   calcCrc = crc32_finalize(&c);
 
-  if (pktCrc != calcCrc) {
-    Serial.println("CRC fail!");
-    goto cleanup;
-  }
+  return (pktCrc == calcCrc);
+}
 
-  Serial.println("CRC pass");
-
-  // decrypt packet
-  for (int ndx = 0; ndx < 12; ndx++) {
-    Serial.print(*(nonce + ndx));
-  }
+/**
+ * Decrypts the encrypted section of the data packet and checks the tag for integrity.
+ * @param pkt packet header
+ * @param pktBuf buffer holding the full packet
+ * @param decryptedBuf buffer with enough space to hold the decrypted data
+ * @return true if the integrity check passed
+ */
+static bool decrypt_pkt(UartPktHdrPlain_t *pkt, uint8_t *pktBuf, 
+                        uint8_t *decryptedBuf) {
+  bool pass = true;
+  
+  const size_t tagLen = 16;
+  uint8_t nonceBuf[NONCE_LEN] = { 0 };
+  ChaChaPoly chacha;
+                          
+  assert(pkt->pktLen > (sizeof(UartPktHdrPlain_t) + tagLen));
+  uint8_t *encryptedData = pktBuf + sizeof(UartPktHdrPlain_t);
+  size_t encryptedDataLen = pkt->pktLen - sizeof(UartPktHdrPlain_t) - tagLen;
+  uint8_t *tag = pktBuf + sizeof(UartPktHdrPlain_t) + encryptedDataLen;
+  memcpy(nonceBuf + sizeof(uint32_t), &pkt->nonce, sizeof(uint64_t)); // copy 8 byte transmitted nonce to 12 byte buf
+  
   Serial.println("");
   Serial.println("Decrypting...");
   chacha.setKey((const uint8_t *)AES_KEY, AES_KEY_LEN);
-  chacha.setIV(nonce, nonceSize);
+  chacha.setIV((uint8_t *)nonceBuf, NONCE_LEN);
 
   chacha.decrypt(decryptedBuf, encryptedData, encryptedDataLen);
 
   Serial.println("Checking tag...");
   if (!chacha.checkTag(tag, tagLen)) {
+    pass = false;
+    goto cleanup;
+  }
+
+cleanup:
+  return pass;
+}
+
+/**
+ * Reads auth response, decrypts it using the ChaChaPoly cipher,
+ * and verifies the connection is secure.
+ */
+static bool verify_auth() {
+  bool authPassed = false;
+  
+  uint8_t buf[MAX_PACKET_SIZE];
+  uint8_t decryptedBuf[MAX_PACKET_SIZE];
+  UartPktHdrEnc_t *hdrEnc = NULL;
+
+  // read data from BLE UART
+  size_t avail = BLEUartGetBytesAvail();
+  size_t readBytes = avail > MAX_PACKET_SIZE ? MAX_PACKET_SIZE : avail;
+  BLEUartRead(buf, readBytes);
+  Serial.println((char *)buf);
+
+  // full packet CRC check
+  UartPktHdrPlain_t *pkt = (UartPktHdrPlain_t *)buf;
+  if (!verify_crc(pkt, buf)) {
+    Serial.println("CRC fail!");
+    goto cleanup;
+  }
+  Serial.println("CRC pass");
+
+  // decryption and integrity check
+  if (!decrypt_pkt(pkt, buf, decryptedBuf)) {
     Serial.println("Bad tag");
     goto cleanup;
   }
-
   Serial.println("Tag passed. Nonce: ");
-  truncNonce = *nonceFull;
-  Serial.println(truncNonce);
+  print_uint64_hex(pkt->nonce);
 
-  if (*nonceFull <= lastNonce) {
+  // make sure nonce is increasing
+  if (pkt->nonce <= lastNonce) {
     Serial.println("Bad nonce");
     goto cleanup;
   }
+  lastNonce = pkt->nonce;
 
+  // check command type
+  hdrEnc = (UartPktHdrEnc_t *)decryptedBuf;
   Serial.print("Command: ");
   Serial.println(hdrEnc->cmd);
   if (hdrEnc->cmd != CMD_AUTHENTICATE) {
@@ -274,7 +321,6 @@ static bool verify_auth() {
     goto cleanup;
   }
 
-  lastNonce = *nonceFull;
   authPassed = true;
 
 cleanup:
